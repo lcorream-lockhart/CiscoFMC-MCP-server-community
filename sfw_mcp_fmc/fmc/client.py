@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any, Dict, List, Optional, Set
@@ -16,6 +17,11 @@ from ..errors import FMCAuthError, FMCRequestError
 from ..logging_conf import configure_logging
 
 logger = configure_logging("sfw-mcp-fmc")
+
+# FMC lets a token pair be refreshed at most 3 times before a full re-authentication
+MAX_TOKEN_REFRESHES = 3
+# Non-idempotent POSTs are not retried on 5xx to avoid duplicate creates/deployments
+_RETRY_5XX = {500, 502, 503, 504}
 
 
 class FMCClient:
@@ -30,6 +36,9 @@ class FMCClient:
     def __init__(self, settings: FMCSettings) -> None:
         self._settings = settings
         self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._refresh_count = 0
+        self._auth_lock = asyncio.Lock()
         self._domain_uuid: Optional[str] = settings.domain_uuid
 
     @staticmethod
@@ -89,7 +98,50 @@ class FMCClient:
             raise FMCAuthError("No X-auth-access-token returned by FMC")
 
         self._access_token = token
+        self._refresh_token = response.headers.get("X-auth-refresh-token")
+        self._refresh_count = 0
 
+    async def _refresh_access_token(self) -> bool:
+        """Refresh the token pair; False means a full re-authentication is needed."""
+        if (
+            not self._access_token
+            or not self._refresh_token
+            or self._refresh_count >= MAX_TOKEN_REFRESHES
+        ):
+            return False
+
+        url = f"{self._settings.base_url}/api/fmc_platform/v1/auth/refreshtoken"
+        try:
+            async with self._build_httpx_client() as client:
+                response = await client.post(
+                    url,
+                    headers={
+                        "X-auth-access-token": self._access_token,
+                        "X-auth-refresh-token": self._refresh_token,
+                    },
+                )
+        except httpx.RequestError as exc:
+            logger.warning("FMC token refresh failed: %s", exc)
+            return False
+
+        new_token = response.headers.get("X-auth-access-token")
+        if response.status_code not in (200, 204) or not new_token:
+            logger.warning("FMC token refresh rejected with status %s", response.status_code)
+            return False
+
+        self._access_token = new_token
+        self._refresh_token = response.headers.get("X-auth-refresh-token") or self._refresh_token
+        self._refresh_count += 1
+        logger.debug("Refreshed FMC access token (refresh #%s)", self._refresh_count)
+        return True
+
+    async def _renew_token(self, stale_token: Optional[str]) -> None:
+        """Refresh or re-authenticate, unless another task already replaced `stale_token`."""
+        async with self._auth_lock:
+            if self._access_token != stale_token:
+                return
+            if not await self._refresh_access_token():
+                await self._authenticate()
     async def _ensure_authenticated(self) -> None:
         if not self._access_token:
             await self._authenticate()
@@ -203,11 +255,27 @@ class FMCClient:
                 method_u, url, headers=headers, params=params, json=json_body
             )
 
-            # refresh token on 401
+            # refresh token on 401 (try a cheap refresh first, then full re-auth)
             if resp.status_code == 401:
-                await self._authenticate()
+                await self._renew_token(headers["X-auth-access-token"])
                 headers["X-auth-access-token"] = self._access_token or ""
                 logger.info("FMC request (retry after 401): %s %s (params=%s)", method_u, url, params)
+                resp = await client.request(
+                    method_u, url, headers=headers, params=params, json=json_body
+                )
+
+            # FMC enforces per-user rate limits; back off and retry on 429 (and transient 5xx for non-POST)
+            for attempt in range(3):
+                retriable = resp.status_code == 429 or (
+                    resp.status_code in _RETRY_5XX and method_u != "POST"
+                )
+                if not retriable:
+                    break
+                delay = 2**attempt
+                logger.warning(
+                    "FMC returned %s on %s %s; retrying in %ss", resp.status_code, method_u, url, delay
+                )
+                await asyncio.sleep(delay)
                 resp = await client.request(
                     method_u, url, headers=headers, params=params, json=json_body
                 )
@@ -265,8 +333,11 @@ class FMCClient:
         start_offset: int = 0,
         ignore_statuses: Optional[Set[int]] = None,
     ) -> List[Dict[str, Any]]:
-        domain_uuid = await self.ensure_domain_uuid()
-        path = f"/api/fmc_config/v1/domain/{domain_uuid}{path_suffix}"
+        if path_suffix.startswith("/api/"):
+            path = path_suffix
+        else:
+            domain_uuid = await self.ensure_domain_uuid()
+            path = f"/api/fmc_config/v1/domain/{domain_uuid}{path_suffix}"
 
         all_items: List[Dict[str, Any]] = []
         offset = max(0, start_offset)
@@ -319,6 +390,33 @@ class FMCClient:
                 break
 
         return all_items
+
+    # Generic API surface (any documented FMC endpoint)
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Raw request; `path` is domain-relative ("object/networks") or absolute ("/api/...")."""
+        return await self._request_json(method, path, params=params, json_body=json_body)
+
+    async def get_all(
+        self,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        expanded: bool = False,
+        max_pages: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Walk offset/limit pagination on any FMC list endpoint."""
+        if not path.startswith("/"):
+            path = "/" + path
+        return await self._list_paginated(
+            path, params=params, expanded=expanded, hard_page_limit=max_pages
+        )
 
     # Devices / assignments
     async def list_device_records(

@@ -17,6 +17,7 @@ from .errors import InvalidIndicatorError
 from .fmc.client import FMCClient
 from .logging_conf import configure_logging
 from .profile_registry import FMCProfile, FMCProfileRegistry
+from .tools import api_tools
 from .tools.find_rules import search_rules_in_policy
 from .tools.search_access import search_access_rules_impl
 from .tools.target_resolver import resolve_target_policies
@@ -26,12 +27,16 @@ logger = configure_logging("sfw-mcp-fmc")
 SERVER_INSTRUCTIONS = (
     "Use list_fmc_profiles first to discover available FMC instances (env mode exposes a single "
     "default profile). Pass the chosen profile id/alias as fmc_profile or omit it to let the server "
-    "use its default. All tools are read-only:\n"
+    "use its default. Rule-search tools are read-only:\n"
     "• find_rules_by_ip_or_fqdn searches one access policy by id.\n"
     "• find_rules_for_target resolves an FTD/HA/cluster target to its assigned access/prefilter "
     "policies before searching them.\n"
     "• search_access_rules performs FMC-wide or policy-scoped searches across access/prefilter policies "
     "and supports network + identity indicators with optional rule filters.\n"
+    "Full API coverage: fmc_get/fmc_get_all/fmc_post/fmc_put/fmc_delete reach any FMC endpoint by path; "
+    "curated tools cover devices, access policies/rules, network/host objects and deployment. "
+    "Write tools modify the FMC (disabled when FMC_READ_ONLY is set); changes need deploy_to_devices "
+    "to reach devices.\n"
     "Credentials come from env vars or profile files; only the FMC REST API is called."
 )
 
@@ -79,6 +84,9 @@ def create_client(profile_key: Optional[str], *, domain_uuid_override: Optional[
         settings = FMCSettings.from_env()
         _client_cache[cache_key] = FMCClient(settings)
     return _client_cache[cache_key]
+
+
+api_tools.register(mcp, create_client)
 
 
 @mcp.tool()

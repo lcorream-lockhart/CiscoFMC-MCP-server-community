@@ -8,6 +8,12 @@ MCP server that exposes high-level tooling for Cisco Secure Firewall Management 
 - `find_rules_for_target` – resolve an FTD device/HA/cluster to its assigned policies and search them.
 - `search_access_rules` – FMC-wide searches with indicator + policy filters, including identity indicators (SGT, realm user/group).
 
+Full API coverage tools (all accept `fmc_profile` and `domain_uuid`):
+
+- Generic passthrough: `fmc_get`, `fmc_get_all`, `fmc_post`, `fmc_put`, `fmc_delete` reach any FMC endpoint by path (domain-relative like `object/networks`, or absolute `/api/...`).
+- Curated: `get_server_version`, `list_domains`, `list_devices`, `get_device`, `list_access_policies`, `get_access_policy`, `list_access_rules`, `get_access_rule`, `create/update/delete_access_rule`, `list/create/update/delete_network_object`, `list/create/delete_host_object`, `get_deployable_devices`, `deploy_to_devices`, `get_deployment_status`.
+- Set `FMC_READ_ONLY=true` to disable every write tool (POST/PUT/DELETE and deployment).
+
 ## 1. Configure FMC access
 
 ### Single FMC (env mode)
